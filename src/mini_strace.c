@@ -10,7 +10,6 @@
  *
  * Next up:
  *   - decode args per x86-64 ABI (rdi, rsi, rdx, r10, r8, r9)
- *   - syscall name table
  *   - errno names instead of raw numbers
  *   - -e trace=network / -e trace=file filters
  *   - dereference pointer args (e.g. the buffer in write/open)
@@ -25,6 +24,8 @@
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <errno.h>
+
+#include "syscall_names.h"
 
 static void run_tracee(char **argv) {
     /* let the parent trace us */
@@ -82,7 +83,7 @@ static void run_tracer(pid_t child) {
         if (!in_syscall) {
             /* syscall entry */
             syscall_no = regs.orig_rax;
-            printf("syscall(%3ld) ", syscall_no);
+            printf("%s(%ld) ", syscall_name(syscall_no), syscall_no);
             fflush(stdout);
             call_count++;
             in_syscall = 1;
