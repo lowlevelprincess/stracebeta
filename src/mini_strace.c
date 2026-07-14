@@ -1,18 +1,19 @@
 /*
- * mini-strace v0.1
+ * mini-strace v0.3
  *
  * Minimal syscall tracer using ptrace(2). Runs a child process,
- * stops it on every syscall entry/exit, prints the syscall number
- * and return value.
+ * stops it on every syscall entry/exit, prints the syscall name,
+ * its raw arguments (per the x86-64 syscall ABI), and the return
+ * value.
  *
  * Build: make
  * Run:   ./mini-strace /bin/ls -la
  *
  * Next up:
- *   - decode args per x86-64 ABI (rdi, rsi, rdx, r10, r8, r9)
  *   - errno names instead of raw numbers
  *   - -e trace=network / -e trace=file filters
- *   - dereference pointer args (e.g. the buffer in write/open)
+ *   - dereference pointer args (e.g. the buffer in write/open) —
+ *     right now pointers just print as raw hex addresses
  */
 
 #include <stdio.h>
@@ -81,9 +82,13 @@ static void run_tracer(pid_t child) {
         }
 
         if (!in_syscall) {
-            /* syscall entry */
+            /* syscall entry — args are in rdi, rsi, rdx, r10, r8, r9
+             * per the x86-64 syscall calling convention */
             syscall_no = regs.orig_rax;
-            printf("%s(%ld) ", syscall_name(syscall_no), syscall_no);
+            printf("%s(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) ",
+                   syscall_name(syscall_no),
+                   regs.rdi, regs.rsi, regs.rdx,
+                   regs.r10, regs.r8, regs.r9);
             fflush(stdout);
             call_count++;
             in_syscall = 1;
