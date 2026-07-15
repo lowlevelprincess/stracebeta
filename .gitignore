@@ -1,0 +1,8 @@
+mini-strace
+*.o
+*.out
+core
+src/syscall_names.h
+
+# macOS
+.DS_Store

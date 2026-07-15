@@ -1,0 +1,4 @@
+mini-strace
+src/syscall_names.h
+*.o
+.git
