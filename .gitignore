@@ -3,6 +3,3 @@ mini-strace
 *.out
 core
 src/syscall_names.h
-
-# macOS
-.DS_Store

@@ -1,10 +1,12 @@
 /*
- * mini-strace v0.5
+ * mini-strace v0.7
  *
  * Minimal syscall tracer using ptrace(2). Runs a child process,
  * stops it on every syscall entry/exit, prints the syscall name,
- * its raw arguments, and the return value — with errno resolved
- * to its macro name on failure.
+ * its arguments, and the return value — with errno resolved to its
+ * macro name on failure. Pointer arguments that are known to be
+ * C-string paths (open, stat, execve, ...) get dereferenced and
+ * printed as quoted strings instead of raw addresses.
  *
  * Supports x86-64 and ARM64 (aarch64) Linux. The two architectures
  * have completely different syscall ABIs — different register
@@ -17,8 +19,7 @@
  *
  * Next up:
  *   - -e trace=network / -e trace=file filters
- *   - dereference pointer args (e.g. the buffer in write/open) —
- *     right now pointers just print as raw hex addresses
+ *   - buffer dumping for write/read (not just NUL-terminated paths)
  */
 
 #define _GNU_SOURCE
@@ -38,6 +39,129 @@
 #endif
 
 #include "syscall_names.h"
+
+/* Which arguments of which syscalls are NUL-terminated C-string
+ * paths, as a bitmask over argument slots 0-5 (bit i set = arg i is
+ * a char* path). Covers the common filesystem/exec syscalls; not
+ * exhaustive — anything not in this table just prints as a raw hex
+ * address, same as before. */
+typedef struct {
+    const char *name;
+    unsigned char str_args;  /* bit i => argument i is a path string */
+} string_arg_entry;
+
+static const string_arg_entry string_arg_table[] = {
+    { "open",        0x01 },
+    { "openat",      0x02 },
+    { "creat",       0x01 },
+    { "access",      0x01 },
+    { "faccessat",   0x02 },
+    { "faccessat2",  0x02 },
+    { "stat",        0x01 },
+    { "lstat",       0x01 },
+    { "newfstatat",  0x02 },
+    { "statx",       0x02 },
+    { "execve",      0x01 },
+    { "execveat",    0x02 },
+    { "unlink",      0x01 },
+    { "unlinkat",    0x02 },
+    { "mkdir",       0x01 },
+    { "mkdirat",     0x02 },
+    { "rmdir",       0x01 },
+    { "chdir",       0x01 },
+    { "rename",      0x03 },  /* args 0 and 1 */
+    { "renameat",    0x0a },  /* args 1 and 3 */
+    { "renameat2",   0x0a },
+    { "readlink",    0x01 },
+    { "readlinkat",  0x02 },
+    { "chmod",       0x01 },
+    { "fchmodat",    0x02 },
+    { "chown",       0x01 },
+    { "lchown",      0x01 },
+    { "fchownat",    0x02 },
+    { "truncate",    0x01 },
+    { "statfs",      0x01 },
+    { NULL,          0x00 },
+};
+
+static unsigned char string_arg_mask(const char *syscall) {
+    for (int i = 0; string_arg_table[i].name != NULL; i++) {
+        if (strcmp(string_arg_table[i].name, syscall) == 0)
+            return string_arg_table[i].str_args;
+    }
+    return 0;
+}
+
+#define STR_ARG_BUF_LEN 200
+
+/* Reads a NUL-terminated string out of the traced process's address
+ * space, one machine word at a time, via PTRACE_PEEKDATA — the
+ * classic way strace has always done this (predates /proc/pid/mem
+ * as a read interface, and doesn't depend on /proc being mounted
+ * with the right options). Falls back to printing the raw address
+ * if the read fails for any reason (bad pointer, unmapped page,
+ * race with the tracee tearing things down, ...) — a failed
+ * dereference shouldn't crash the tracer, it should just degrade to
+ * what v0.6 already did. */
+static void read_child_string(pid_t pid, unsigned long long addr, char *out, size_t out_size) {
+    if (addr == 0) {
+        snprintf(out, out_size, "NULL");
+        return;
+    }
+
+    unsigned char raw[STR_ARG_BUF_LEN];
+    size_t got = 0;
+
+    while (got + sizeof(long) <= sizeof(raw)) {
+        errno = 0;
+        long word = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + got), NULL);
+        if (word == -1 && errno != 0)
+            break;  /* unmapped/invalid address — stop, use what we have */
+
+        memcpy(raw + got, &word, sizeof(long));
+        got += sizeof(long);
+
+        int has_nul = 0;
+        for (size_t i = 0; i < sizeof(long); i++) {
+            if (((unsigned char *)&word)[i] == '\0') { has_nul = 1; break; }
+        }
+        if (has_nul)
+            break;
+    }
+
+    if (got == 0) {
+        snprintf(out, out_size, "0x%llx", addr);
+        return;
+    }
+
+    size_t len = 0;
+    while (len < got && raw[len] != '\0')
+        len++;
+    int truncated = (len == got);  /* string may continue past our read window */
+
+    size_t oi = 0;
+    if (oi < out_size) out[oi++] = '"';
+    for (size_t i = 0; i < len && oi + 5 < out_size; i++) {
+        unsigned char c = raw[i];
+        if (c == '"' || c == '\\') {
+            out[oi++] = '\\';
+            out[oi++] = (char)c;
+        } else if (c == '\n') {
+            out[oi++] = '\\'; out[oi++] = 'n';
+        } else if (c >= 0x20 && c < 0x7f) {
+            out[oi++] = (char)c;
+        } else {
+            oi += (size_t)snprintf(out + oi, out_size - oi, "\\x%02x", c);
+        }
+    }
+    if (oi < out_size) out[oi++] = '"';
+    if (truncated && oi + 3 < out_size) {
+        memcpy(out + oi, "...", 3);
+        oi += 3;
+    }
+    if (oi < out_size) out[oi] = '\0';
+    else out[out_size - 1] = '\0';
+}
 
 #if defined(__x86_64__)
 
@@ -156,13 +280,30 @@ static void run_tracer(pid_t child) {
         }
 
         if (!in_syscall) {
-            /* syscall entry — print the syscall name and its raw
-             * argument registers, per the platform's syscall ABI */
+            /* syscall entry — print the syscall name and its
+             * arguments. Known path-string arguments (per
+             * string_arg_table) get dereferenced from the child's
+             * memory and printed quoted; everything else prints as
+             * a raw hex address/value, same as before. */
             syscall_no = syscall_no_of(&regs);
-            printf("%s(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) ",
-                   syscall_name(syscall_no),
-                   arg0(&regs), arg1(&regs), arg2(&regs),
-                   arg3(&regs), arg4(&regs), arg5(&regs));
+            const char *name = syscall_name(syscall_no);
+            unsigned long long raw_args[6] = {
+                arg0(&regs), arg1(&regs), arg2(&regs),
+                arg3(&regs), arg4(&regs), arg5(&regs),
+            };
+            unsigned char str_mask = string_arg_mask(name);
+
+            char argbuf[6][STR_ARG_BUF_LEN];
+            for (int i = 0; i < 6; i++) {
+                if (str_mask & (1 << i))
+                    read_child_string(child, raw_args[i], argbuf[i], sizeof(argbuf[i]));
+                else
+                    snprintf(argbuf[i], sizeof(argbuf[i]), "0x%llx", raw_args[i]);
+            }
+
+            printf("%s(%s, %s, %s, %s, %s, %s) ",
+                   name, argbuf[0], argbuf[1], argbuf[2],
+                   argbuf[3], argbuf[4], argbuf[5]);
             fflush(stdout);
             call_count++;
             in_syscall = 1;
