@@ -1,12 +1,14 @@
 /*
- * mini-strace v0.7
+ * mini-strace v0.8
  *
  * Minimal syscall tracer using ptrace(2). Runs a child process,
  * stops it on every syscall entry/exit, prints the syscall name,
  * its arguments, and the return value — with errno resolved to its
  * macro name on failure. Pointer arguments that are known to be
  * C-string paths (open, stat, execve, ...) get dereferenced and
- * printed as quoted strings instead of raw addresses.
+ * printed as quoted strings instead of raw addresses. write()'s
+ * output buffer gets dumped the same way, minus the NUL-termination
+ * assumption (a write buffer isn't necessarily text).
  *
  * Supports x86-64 and ARM64 (aarch64) Linux. The two architectures
  * have completely different syscall ABIs — different register
@@ -19,7 +21,10 @@
  *
  * Next up:
  *   - -e trace=network / -e trace=file filters
- *   - buffer dumping for write/read (not just NUL-terminated paths)
+ *   - dump read()'s buffer too — trickier than write(), since the
+ *     buffer is only filled *after* the syscall runs, so it has to
+ *     be read at the exit-stop using the actual byte count returned,
+ *     not at entry like everything else here
  */
 
 #define _GNU_SOURCE
@@ -92,6 +97,34 @@ static unsigned char string_arg_mask(const char *syscall) {
     return 0;
 }
 
+/* Syscalls whose input is a raw (not NUL-terminated) byte buffer,
+ * paired with which argument slot holds the buffer and which slot
+ * holds its length. Unlike string_arg_table this only covers
+ * "output" syscalls — the buffer is already populated by the caller
+ * before the syscall runs, so it can be dereferenced at the same
+ * entry-stop as everything else. read()'s buffer is the opposite
+ * case (empty until the syscall actually runs) and needs different
+ * handling — see the TODO at the top of the file. */
+typedef struct {
+    const char *name;
+    int buf_idx;
+    int len_idx;
+} buffer_arg_entry;
+
+static const buffer_arg_entry buffer_arg_table[] = {
+    { "write",    1, 2 },
+    { "pwrite64", 1, 2 },
+    { NULL,       0, 0 },
+};
+
+static const buffer_arg_entry *buffer_arg_lookup(const char *syscall) {
+    for (int i = 0; buffer_arg_table[i].name != NULL; i++) {
+        if (strcmp(buffer_arg_table[i].name, syscall) == 0)
+            return &buffer_arg_table[i];
+    }
+    return NULL;
+}
+
 #define STR_ARG_BUF_LEN 200
 
 /* Reads a NUL-terminated string out of the traced process's address
@@ -156,6 +189,62 @@ static void read_child_string(pid_t pid, unsigned long long addr, char *out, siz
     }
     if (oi < out_size) out[oi++] = '"';
     if (truncated && oi + 3 < out_size) {
+        memcpy(out + oi, "...", 3);
+        oi += 3;
+    }
+    if (oi < out_size) out[oi] = '\0';
+    else out[out_size - 1] = '\0';
+}
+
+/* Same idea as read_child_string but for a buffer whose length is
+ * known up front (from the syscall's own length argument) instead
+ * of being NUL-terminated — write()'s data isn't necessarily text,
+ * so this doesn't stop early at a zero byte, it just reads min(len,
+ * our cap) bytes and escapes all of them. */
+static void read_child_buffer(pid_t pid, unsigned long long addr, unsigned long long len,
+                               char *out, size_t out_size) {
+    if (addr == 0) {
+        snprintf(out, out_size, "NULL");
+        return;
+    }
+
+    size_t want = (len < STR_ARG_BUF_LEN) ? (size_t)len : STR_ARG_BUF_LEN;
+    unsigned char raw[STR_ARG_BUF_LEN];
+    size_t got = 0;
+
+    while (got < want) {
+        errno = 0;
+        long word = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + got), NULL);
+        if (word == -1 && errno != 0)
+            break;  /* unmapped/invalid address — stop, use what we have */
+
+        size_t chunk = (want - got < sizeof(long)) ? (want - got) : sizeof(long);
+        memcpy(raw + got, &word, chunk);
+        got += chunk;
+    }
+
+    if (got == 0) {
+        snprintf(out, out_size, "0x%llx", addr);
+        return;
+    }
+
+    size_t oi = 0;
+    if (oi < out_size) out[oi++] = '"';
+    for (size_t i = 0; i < got && oi + 5 < out_size; i++) {
+        unsigned char c = raw[i];
+        if (c == '"' || c == '\\') {
+            out[oi++] = '\\';
+            out[oi++] = (char)c;
+        } else if (c == '\n') {
+            out[oi++] = '\\'; out[oi++] = 'n';
+        } else if (c >= 0x20 && c < 0x7f) {
+            out[oi++] = (char)c;
+        } else {
+            oi += (size_t)snprintf(out + oi, out_size - oi, "\\x%02x", c);
+        }
+    }
+    if (oi < out_size) out[oi++] = '"';
+    if (len > got && oi + 3 < out_size) {  /* real buffer is longer than what we dumped */
         memcpy(out + oi, "...", 3);
         oi += 3;
     }
@@ -292,11 +381,15 @@ static void run_tracer(pid_t child) {
                 arg3(&regs), arg4(&regs), arg5(&regs),
             };
             unsigned char str_mask = string_arg_mask(name);
+            const buffer_arg_entry *buf_entry = buffer_arg_lookup(name);
 
             char argbuf[6][STR_ARG_BUF_LEN];
             for (int i = 0; i < 6; i++) {
                 if (str_mask & (1 << i))
                     read_child_string(child, raw_args[i], argbuf[i], sizeof(argbuf[i]));
+                else if (buf_entry != NULL && i == buf_entry->buf_idx)
+                    read_child_buffer(child, raw_args[i], raw_args[buf_entry->len_idx],
+                                       argbuf[i], sizeof(argbuf[i]));
                 else
                     snprintf(argbuf[i], sizeof(argbuf[i]), "0x%llx", raw_args[i]);
             }

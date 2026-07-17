@@ -9,7 +9,8 @@ prints every syscall it makes: name, arguments, and return value
 (errno resolved to its macro name on failure). Pointer arguments that
 are known to be C-string paths (`open`, `stat`, `execve`, ...) get
 dereferenced and printed as quoted strings instead of raw addresses.
-Works on x86-64 and ARM64 Linux.
+`write()`'s output buffer gets dumped the same way. Works on x86-64
+and ARM64 Linux.
 
 ## Build
 
@@ -27,15 +28,14 @@ openat(0xffffff9c, "/etc/ld.so.cache", 0x80000, 0x0, 0x0, 0x0) = 3
 openat(0xffffff9c, "/lib/x86_64-linux-gnu/libc.so.6", 0x80000, 0x0, 0x0, 0x0) = 3
 openat(0xffffff9c, "/tmp/somefile.txt", 0x0, 0x0, 0xffffffff, 0x0) = 3
 read(0x3, 0x7fe35154f000, 0x20000, 0x22, 0x0, 0x7fe3515c0440) = 10
-write(0x1, 0x7fe35154f000, 0xa, 0x22, 0x0, 0x7fe3515c0440) = 10
+write(0x1, "test data\n", 0xa, 0x22, 0x0, 0x7fe3515c0440) = 10
 [mini-strace] process exited, code 0, total syscalls: 37
 ```
 
-Arguments not recognized as path strings still print raw, per the ABI
-slot they came from — a `struct stat*` buffer, for instance, is just a
-hex address for now (only NUL-terminated string args get dereferenced,
-not arbitrary structs or byte buffers). Failed calls resolve errno to
-its macro name via glibc's `strerrorname_np()`.
+Arguments not recognized as path strings or write buffers still print
+raw, per the ABI slot they came from — a `struct stat*` buffer, for
+instance, is just a hex address for now. Failed calls resolve errno
+to its macro name via glibc's `strerrorname_np()`.
 
 ## How it works (briefly)
 
@@ -68,11 +68,22 @@ small lookup table (`string_arg_table` in `mini_strace.c`) rather than
 anything automatic — there's no generic way to know a `long` argument
 is "really" a `char*` without knowing the syscall's signature.
 
+`write()`'s buffer uses the same read mechanism but a separate table
+(`buffer_arg_table`), since it isn't NUL-terminated — the read stops
+at a fixed byte count (the syscall's own length argument) instead of
+the first zero byte, and every byte gets escaped, not just the
+non-printable ones a text path would have. This only works for
+"input" syscalls where the data already exists before the call runs.
+`read()` is the opposite — its buffer is empty at entry and only
+populated after the kernel does its thing — so dumping it needs
+reading at the *exit* stop using the actual return value as the
+length, which the current entry-only argument-printing code doesn't
+support yet (see Todo).
+
 ## Todo / where I'm taking this
 
-- buffer dumping for write/read (not just NUL-terminated paths — raw
-  byte buffers, which don't have a natural stopping point the way a
-  C string does)
+- dump read()'s buffer too — needs reading it at the exit-stop with
+  the actual byte count, not entry like everything else currently
 - basic filtering, e.g. only show network or file syscalls
 - attach to an already-running process by PID
 - maybe a summary mode at the end (counts per syscall, like strace -c)
