@@ -1,5 +1,5 @@
 /*
- * mini-strace v0.8
+ * mini-strace v0.9
  *
  * Minimal syscall tracer using ptrace(2). Runs a child process,
  * stops it on every syscall entry/exit, prints the syscall name,
@@ -7,8 +7,10 @@
  * macro name on failure. Pointer arguments that are known to be
  * C-string paths (open, stat, execve, ...) get dereferenced and
  * printed as quoted strings instead of raw addresses. write()'s
- * output buffer gets dumped the same way, minus the NUL-termination
- * assumption (a write buffer isn't necessarily text).
+ * output buffer and read()'s input buffer both get dumped the same
+ * way, minus the NUL-termination assumption (the data isn't
+ * necessarily text) — read()'s dump is deferred to the exit-stop
+ * since its buffer is only actually filled after the syscall runs.
  *
  * Supports x86-64 and ARM64 (aarch64) Linux. The two architectures
  * have completely different syscall ABIs — different register
@@ -21,10 +23,7 @@
  *
  * Next up:
  *   - -e trace=network / -e trace=file filters
- *   - dump read()'s buffer too — trickier than write(), since the
- *     buffer is only filled *after* the syscall runs, so it has to
- *     be read at the exit-stop using the actual byte count returned,
- *     not at entry like everything else here
+ *   - attach to an already-running process by PID
  */
 
 #define _GNU_SOURCE
@@ -121,6 +120,29 @@ static const buffer_arg_entry *buffer_arg_lookup(const char *syscall) {
     for (int i = 0; buffer_arg_table[i].name != NULL; i++) {
         if (strcmp(buffer_arg_table[i].name, syscall) == 0)
             return &buffer_arg_table[i];
+    }
+    return NULL;
+}
+
+/* Syscalls whose output is a raw byte buffer that's only populated
+ * *after* the syscall actually runs — read()'s buf is garbage/empty
+ * at the entry-stop, so unlike write() this can't be dereferenced
+ * there. These get looked up separately and handled by deferring
+ * the whole print to the exit-stop, where the return value tells us
+ * how many bytes actually landed in the buffer. Reuses
+ * buffer_arg_entry since the shape (which arg is the buffer) is the
+ * same idea — len_idx is unused here since the real length is the
+ * return value, not the requested count. */
+static const buffer_arg_entry read_arg_table[] = {
+    { "read",    1, 2 },
+    { "pread64", 1, 2 },
+    { NULL,      0, 0 },
+};
+
+static const buffer_arg_entry *read_arg_lookup(const char *syscall) {
+    for (int i = 0; read_arg_table[i].name != NULL; i++) {
+        if (strcmp(read_arg_table[i].name, syscall) == 0)
+            return &read_arg_table[i];
     }
     return NULL;
 }
@@ -317,6 +339,15 @@ static void run_tracer(pid_t child) {
     long call_count = 0;
     int pending_signal = 0;  /* signal to re-deliver to the child, if any */
 
+    /* State for syscalls whose print gets deferred to the exit-stop
+     * (currently just read()/pread64() — see read_arg_table above).
+     * pending_read_entry doubles as the "is a print deferred right
+     * now" flag; NULL means the exit-stop should use the normal
+     * immediate "= ret" path instead. */
+    const char *pending_name = NULL;
+    unsigned long long pending_args[6] = {0};
+    const buffer_arg_entry *pending_read_entry = NULL;
+
     /* wait for the initial SIGSTOP from raise() above */
     waitpid(child, &status, 0);
 
@@ -369,41 +400,77 @@ static void run_tracer(pid_t child) {
         }
 
         if (!in_syscall) {
-            /* syscall entry — print the syscall name and its
-             * arguments. Known path-string arguments (per
-             * string_arg_table) get dereferenced from the child's
-             * memory and printed quoted; everything else prints as
-             * a raw hex address/value, same as before. */
+            /* syscall entry */
             syscall_no = syscall_no_of(&regs);
             const char *name = syscall_name(syscall_no);
             unsigned long long raw_args[6] = {
                 arg0(&regs), arg1(&regs), arg2(&regs),
                 arg3(&regs), arg4(&regs), arg5(&regs),
             };
-            unsigned char str_mask = string_arg_mask(name);
-            const buffer_arg_entry *buf_entry = buffer_arg_lookup(name);
 
-            char argbuf[6][STR_ARG_BUF_LEN];
-            for (int i = 0; i < 6; i++) {
-                if (str_mask & (1 << i))
-                    read_child_string(child, raw_args[i], argbuf[i], sizeof(argbuf[i]));
-                else if (buf_entry != NULL && i == buf_entry->buf_idx)
-                    read_child_buffer(child, raw_args[i], raw_args[buf_entry->len_idx],
-                                       argbuf[i], sizeof(argbuf[i]));
-                else
-                    snprintf(argbuf[i], sizeof(argbuf[i]), "0x%llx", raw_args[i]);
+            const buffer_arg_entry *read_entry = read_arg_lookup(name);
+            if (read_entry != NULL) {
+                /* read()-family: its buffer is unpopulated until the
+                 * syscall actually runs, so there's nothing useful
+                 * to dereference yet — stash everything and print
+                 * the whole line at the exit-stop instead, once we
+                 * know the real byte count from the return value. */
+                pending_name = name;
+                memcpy(pending_args, raw_args, sizeof(raw_args));
+                pending_read_entry = read_entry;
+            } else {
+                /* everything else prints immediately, same as before:
+                 * known path-string args get dereferenced, write()'s
+                 * buffer gets dumped, everything unrecognized prints
+                 * as a raw hex address/value. */
+                pending_read_entry = NULL;
+                unsigned char str_mask = string_arg_mask(name);
+                const buffer_arg_entry *buf_entry = buffer_arg_lookup(name);
+
+                char argbuf[6][STR_ARG_BUF_LEN];
+                for (int i = 0; i < 6; i++) {
+                    if (str_mask & (1 << i))
+                        read_child_string(child, raw_args[i], argbuf[i], sizeof(argbuf[i]));
+                    else if (buf_entry != NULL && i == buf_entry->buf_idx)
+                        read_child_buffer(child, raw_args[i], raw_args[buf_entry->len_idx],
+                                           argbuf[i], sizeof(argbuf[i]));
+                    else
+                        snprintf(argbuf[i], sizeof(argbuf[i]), "0x%llx", raw_args[i]);
+                }
+
+                printf("%s(%s, %s, %s, %s, %s, %s) ",
+                       name, argbuf[0], argbuf[1], argbuf[2],
+                       argbuf[3], argbuf[4], argbuf[5]);
+                fflush(stdout);
             }
-
-            printf("%s(%s, %s, %s, %s, %s, %s) ",
-                   name, argbuf[0], argbuf[1], argbuf[2],
-                   argbuf[3], argbuf[4], argbuf[5]);
-            fflush(stdout);
             call_count++;
             in_syscall = 1;
         } else {
             /* syscall exit — return value in whichever register the
              * platform uses for it */
             long ret = return_val_of(&regs);
+
+            if (pending_read_entry != NULL) {
+                /* this is the deferred read()-family print: build
+                 * the whole "name(args) = ret" line now, using ret
+                 * itself as the buffer length — that's the actual
+                 * number of bytes the kernel put there, which is
+                 * usually less than the requested count and is the
+                 * only length we can trust at this point. */
+                char argbuf[6][STR_ARG_BUF_LEN];
+                for (int i = 0; i < 6; i++) {
+                    if (i == pending_read_entry->buf_idx && ret > 0)
+                        read_child_buffer(child, pending_args[i], (unsigned long long)ret,
+                                           argbuf[i], sizeof(argbuf[i]));
+                    else
+                        snprintf(argbuf[i], sizeof(argbuf[i]), "0x%llx", pending_args[i]);
+                }
+                printf("%s(%s, %s, %s, %s, %s, %s) ",
+                       pending_name, argbuf[0], argbuf[1], argbuf[2],
+                       argbuf[3], argbuf[4], argbuf[5]);
+                pending_read_entry = NULL;
+            }
+
             if (ret < 0) {
                 const char *ename = strerrorname_np((int)(-ret));
                 printf("= %ld (%s)\n", ret, ename ? ename : "unknown errno");
