@@ -1,31 +1,19 @@
-# mini-strace
+# stracebeta
 
-A stripped-down clone of `strace`, built on Linux's `ptrace(2)` API
+A stripped-down clone of `strace`, built on Linux's `ptrace(2)` API.
 
-## What it does right now
+## What it does
 
-Runs a target program as a child process, attaches via ptrace, and
-prints every syscall it makes: name, arguments, and return value
-(errno resolved to its macro name on failure). Pointer arguments that
-are known to be C-string paths (`open`, `stat`, `execve`, ...) get
-dereferenced and printed as quoted strings instead of raw addresses.
-`write()`'s output buffer and `read()`'s input buffer both get dumped
-the same way. Works on x86-64 and ARM64 Linux.
-
-## Build
-
-```bash
-make
-./mini-strace /bin/echo hello world
-```
-
-Real output, tracing `/bin/cat /tmp/somefile.txt`:
+Traces a target program and prints every syscall: name, arguments,
+return value. Failed calls show the errno name (`ENOENT`, not `2`).
+`open`/`stat`/`execve` and friends show their path argument as an actual string
+instead of a pointer, and `read`/`write` show the bytes they're
+moving:
 
 ```
 execve("/bin/cat", 0x7fff39fbada0, 0x7fff39fbadc0, 0x0, 0xffffffff, 0x7f45c4f4c740) = 0
 access("/etc/ld.so.preload", 0x4, 0x556158984d10, 0x22, 0x7ff5eca8b000, 0x7ff5ecac1440) = -2 (ENOENT)
 openat(0xffffff9c, "/etc/ld.so.cache", 0x80000, 0x0, 0x0, 0x0) = 3
-openat(0xffffff9c, "/lib/x86_64-linux-gnu/libc.so.6", 0x80000, 0x0, 0x0, 0x0) = 3
 openat(0xffffff9c, "/tmp/somefile.txt", 0x0, 0x0, 0xffffffff, 0x0) = 3
 read(0x3, "test data content\n", 0x20000, 0x22, 0x0, 0x7fe3515c0440) = 18
 write(0x1, "test data content\n", 0x12, 0x22, 0x0, 0x7fe3515c0440) = 18
@@ -33,91 +21,56 @@ read(0x3, 0x7fa474eae000, 0x20000, 0x22, 0x0, 0x7fa474f1f440) = 0
 [mini-strace] process exited, code 0, total syscalls: 37
 ```
 
-Note the last `read()` — it hit EOF (`= 0`), so there's nothing to
-dump and its buffer arg falls back to a raw address, same as anything
-unrecognized. Arguments not recognized as path strings or dumpable
-buffers still print raw, per the ABI slot they came from — a `struct
-stat*` buffer, for instance, is just a hex address for now. Failed
-calls resolve errno to its macro name via glibc's `strerrorname_np()`.
 
-## How it works (briefly)
-
-The child calls `PTRACE_TRACEME` then `SIGSTOP`s itself before `execvp`.
-The parent waits for that stop, then loops on `PTRACE_SYSCALL`, which
-pauses the child on every syscall entry and exit, reading registers to
-get the syscall number, arguments, and return value.
-
-x86-64 and ARM64 do this completely differently, different register
-names, `PTRACE_GETREGS` vs `PTRACE_GETREGSET`, different argument
-registers, different syscall numbering entirely. All of that is behind
-`#ifdef __x86_64__` / `#ifdef __aarch64__` in `mini_strace.c`.
-
-`src/syscall_names.h` is generated per-architecture by
-`scripts/gen_syscall_table.sh` (it asks gcc to preprocess the
-platform's syscall header rather than reading a hardcoded path, since
-that path differs across toolchains) and rebuilt automatically by
-`make` every time, since the file isn't committed — it has to match
-whatever machine you're actually building on. A few syscalls (`mmap`,
-`stat`, `fstat`, ...) aren't defined as a plain number in the header —
-they're defined through a level of indirection (`__NR_mmap` →
-`__NR3264_mmap` → `222`), so the generator resolves that chain instead
-of just grepping for digits.
-
-Path-string arguments are read out of the child's memory one machine
-word at a time via `PTRACE_PEEKDATA` — the same mechanism `strace`
-itself has used since before `/proc/pid/mem` existed as a read
-interface. Which argument slot is a string, for which syscall, is a
-small lookup table (`string_arg_table` in `mini_strace.c`) rather than
-anything automatic — there's no generic way to know a `long` argument
-is "really" a `char*` without knowing the syscall's signature.
-
-`write()`'s buffer uses the same read mechanism but a separate table
-(`buffer_arg_table`), since it isn't NUL-terminated — the read stops
-at a fixed byte count (the syscall's own length argument) instead of
-the first zero byte, and every byte gets escaped, not just the
-non-printable ones a text path would have. This only works for
-"input" syscalls where the data already exists before the call runs.
-
-`read()` is the opposite case: its buffer is empty at the entry-stop
-and only populated after the kernel actually runs the syscall, so
-dumping it needs a different flow. For anything in `read_arg_table`,
-the tracer doesn't print at entry at all — it stashes the syscall
-name and raw arguments and waits for the matching exit-stop, where
-the return value (the real byte count, which is usually less than
-the requested count) becomes the dump length. The whole `name(args) =
-ret` line gets built and printed there instead. A `read()` that hits
-EOF or an error just skips the dump — there's no valid data to show.
-
-## Todo / where I'm taking this
-
-- basic filtering, e.g. only show network or file syscalls
-- attach to an already-running process by PID
-- maybe a summary mode at the end (counts per syscall, like strace -c)
-
-## Requirements
-
-Linux, x86-64 or ARM64, gcc, make, python3 (used only by the syscall
-table generator).
-
-### macOS / no native Linux
-
-ptrace is Linux-only, so this needs a Linux VM or container either
-way. There's a `Dockerfile` in the repo with everything preinstalled:
+## Build & run
 
 ```bash
-docker build -t mini-strace-dev .
-docker run --rm -it --cap-add=SYS_PTRACE -v "$(pwd)":/app -w /app mini-strace-dev
-# inside the container:
 make
 ./mini-strace /bin/echo hello world
 ```
 
-`--cap-add=SYS_PTRACE` is required, Docker blocks ptrace by default.
-On Apple Silicon, don't add `--platform linux/amd64`: cross-arch QEMU
-emulation breaks ptrace's register access (`PTRACE_GETREGS`/
-`GETREGSET` start failing with EIO). Build and run the image native
-to your host architecture instead.
+On macOS:
 
-## License
+```bash
+docker compose run --rm dev
+make
+./mini-strace /bin/echo hello world
+```
 
-MIT
+## How it works
+
+The child does `PTRACE_TRACEME` then `SIGSTOP`s itself before
+`execvp`. The parent waits for that, then loops on `PTRACE_SYSCALL`,
+which stops the child at every syscall entry and exit and lets the
+tracer read its registers in between.
+
+`scripts/gen_syscall_table.sh` asks gcc to preprocess the platform's syscall header and pulls the
+`__NR_*` defines out of that, which sidesteps having to hardcode a
+header path . A few syscalls — `mmap`, `stat`, `fstat` aren't a plain number in the
+header, they're defined through a level of indirection (`__NR_mmap`
+-> `__NR3264_mmap` -> `222`), so the generator follows that chain. The
+table gets regenerated on every `make`, since it has to match
+whatever machine you're actually building on and isn't committed.
+
+Path arguments and buffer contents get pulled out of the child's
+memory one word at a time via `PTRACE_PEEKDATA`, the same mechanism
+`strace` used long before `/proc/pid/mem` existed as a read interface.
+
+`read()` needed a different approach than `write()`. `write()`'s
+buffer already has real data at the entry-stop, so it prints
+immediately like everything else. `read()`'s buffer is empty at that
+point, the kernel hasn't run yet, so for that one the tracer holds
+off printing anything at entry, waits for the exit-stop, and uses the
+return value (the actual byte count, usually less than what was
+requested) as the dump length.
+
+## Todo
+
+- `-e trace=network` / `-e trace=file` style filters
+- attach to an already-running process by PID
+- summary mode at the end, counts per syscall (like `strace -c`)
+
+## Requirements
+
+Linux, x86-64 or ARM64, gcc, make, python3 (only used by the syscall
+table generator).
